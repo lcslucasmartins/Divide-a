@@ -590,6 +590,7 @@ function irSenha(){
 }
 function irLogin(){
   pararSync();
+  if(D.pendente&&!_enviando)enviar();
   document.getElementById('pg-app').classList.remove('on');
   document.getElementById('pg-senha').classList.remove('on');
   document.getElementById('pg-login').classList.add('on');
@@ -684,141 +685,198 @@ function rAtual(){
   if(aid==='dados')   rDados();
 }
 
-// Aplica os dados vindos da planilha (fonte de verdade)
-function aplicarDados(d){
-  if(Array.isArray(d.expenses)) D.gastos   = d.expenses;
-  if(Array.isArray(d.incomes))  D.entradas = d.incomes;
-  if(Array.isArray(d.cartoes))  D.cartoes  = d.cartoes;
-  if(Array.isArray(d.compras))  D.compras  = d.compras;
-  if(Array.isArray(d.users) && d.users.filter(function(u){return !u.joint;}).length){
-    D.usuarios = d.users;
-    if(!D.usuarios.find(function(u){return u.joint;}))
-      D.usuarios.push({id:'joint',nome:'Conjunta',ini:'🔗',cor:'#8A4F08',bg:'#FAE8CE',joint:true});
-    if(D.usuario){var nu=puid(D.usuario.id);if(nu)D.usuario=nu;}
+// ═══════════════════════════════════════════════
+// SINCRONIZAÇÃO v4 — regras:
+//  • Ler da planilha NUNCA apaga dado do celular: os dois lados são
+//    MESCLADOS por id; vence a versão editada por último.
+//  • Só some o que foi excluído de forma explícita (lista "removidos").
+//  • Um envio só é dado como salvo depois que a planilha devolve,
+//    relida, cada registro deste celular.
+//  • Se a planilha estiver com script antigo, o app NÃO envia nada.
+// ═══════════════════════════════════════════════
+var VERSAO_SERVIDOR = 4;
+var COLS = [['gastos','expenses'],['entradas','incomes'],['cartoes','cartoes'],['compras','compras'],['usuarios','users']];
+
+function carimbo(o){return String(o.atualizado||o.criado||'');}
+
+// Junta duas listas por id. Em empate de versão, fica a da planilha.
+function mesclarLista(local,servidor,tomb){
+  var mapa={},ordem=[];
+  function por(x,daPlanilha){
+    if(!x||x.id===undefined||x.id===null||x.id==='')return;
+    var id=String(x.id);
+    if(tomb[id]&&id!=='joint')return;
+    if(!mapa[id]){mapa[id]=x;ordem.push(id);return;}
+    var a=carimbo(x),b=carimbo(mapa[id]);
+    if(a>b||(a===b&&daPlanilha))mapa[id]=x;
   }
-  salvarTudo();
-  rAtual();
+  (local||[]).forEach(function(x){por(x,false);});
+  (servidor||[]).forEach(function(x){por(x,true);});
+  return ordem.map(function(id){return mapa[id];});
 }
 
-var _enviando=false,_reenviar=false;
+// O que este celular tem que a planilha ainda não tem?
+function diferencaLocal(srvData,srvRm){
+  var n=0,tombSrv={};(srvRm||[]).forEach(function(id){tombSrv[String(id)]=1;});
+  COLS.forEach(function(c){
+    var m={};(srvData[c[1]]||[]).forEach(function(x){m[String(x.id)]=x;});
+    (D[c[0]]||[]).forEach(function(x){
+      if(x.joint)return;
+      var y=m[String(x.id)];
+      if(!y||carimbo(x)>carimbo(y))n++;
+    });
+  });
+  D.removidos.forEach(function(id){if(!tombSrv[String(id)])n++;});
+  return n;
+}
+
+function versaoOk(res){
+  if(res&&res.versao>=VERSAO_SERVIDOR)return true;
+  setSbar('🔴 Script da planilha desatualizado — nada foi enviado','#FAE0E0','#9E2B2B');
+  setSyncSt('🔴 O Apps Script implantado é antigo. Implante a versão nova (Gerenciar implantações → Nova versão). Seus dados continuam salvos neste celular.','#FAE0E0','#9E2B2B');
+  return false;
+}
+
+// Recebe o estado da planilha e mescla com o do celular
+function receberDaPlanilha(res){
+  var d=res.data||{},rm=res.removidos||[];
+  var tomb={};rm.concat(D.removidos).forEach(function(id){tomb[String(id)]=1;});
+  COLS.forEach(function(c){D[c[0]]=mesclarLista(D[c[0]],d[c[1]],tomb);});
+  if(!D.usuarios.filter(function(u){return !u.joint;}).length)D.usuarios=JSON.parse(JSON.stringify(USU_PAD));
+  if(!D.usuarios.find(function(u){return u.joint;}))
+    D.usuarios.push({id:'joint',nome:'Conjunta',ini:'🔗',cor:'#8A4F08',bg:'#FAE8CE',joint:true});
+  if(D.usuario){var nu=puid(D.usuario.id);if(nu)D.usuario=nu;}
+  // tombstones já registrados na planilha não precisam mais ser enviados
+  var rmSrv={};rm.forEach(function(id){rmSrv[String(id)]=1;});
+  D.removidos=D.removidos.filter(function(id){return !rmSrv[String(id)];});
+  var falta=diferencaLocal(d,rm);
+  D.pendente=falta>0;
+  salvarTudo();
+  rAtual();
+  return falta;
+}
+
+function mostrarStatus(falta){
+  if(falta>0)setSbar('🟡 '+falta+' alteraç'+(falta>1?'ões':'ão')+' ainda não estão na planilha — enviando','#FFF3CD','#8A4F08');
+  else setSbar('🟢 Tudo salvo na planilha','#E4F0DA','#276B0F');
+}
+
+var _enviando=false,_reenviar=false,_buscando=false;
+
+function jsonpGet(onOk,onFail){
+  var cb='_cv'+Date.now()+Math.floor(Math.random()*99999);
+  var sc=document.createElement('script');
+  var t=setTimeout(function(){window[cb]=function(){};limpar();onFail('tempo esgotado');},20000);
+  function limpar(){if(sc.parentNode)sc.parentNode.removeChild(sc);}
+  window[cb]=function(res){clearTimeout(t);window[cb]=function(){};limpar();onOk(res);};
+  sc.onerror=function(){clearTimeout(t);window[cb]=function(){};limpar();onFail('sem conexão');};
+  sc.src=SHEETS+(SHEETS.indexOf('?')<0?'?':'&')+'action=getAll&callback='+cb+'&t='+Date.now();
+  document.head.appendChild(sc);
+}
 
 function buscar(silencioso){
-  // Se há alterações locais não confirmadas, enviar vem antes de buscar
-  if(D.pendente||_enviando){ if(!_enviando)enviar(); return; }
+  if(_enviando||_buscando)return;
+  _buscando=true;
   if(!silencioso)setSyncSt('🔄 Buscando...','#E6EFFA','#1A5EAA');
-  setSbar('🔄 Sincronizando...','#E6EFFA','#1A5EAA');
-  var old=document.getElementById('_js');
-  if(old)old.parentNode.removeChild(old);
-  var cb='_cb'+Date.now();
-  var timer=setTimeout(function(){window[cb]=function(){};setSbar('🟡 Sem resposta da planilha — usando dados locais','#FFF3CD','#8A4F08');},15000);
-  window[cb]=function(res){
-    clearTimeout(timer);
-    window[cb]=function(){};
-    var s=document.getElementById('_js');if(s)s.parentNode.removeChild(s);
-    if(res&&res.ok&&res.data){
-      // Se o usuário alterou algo enquanto a busca estava no ar, não sobrescreve
-      if(D.pendente||_enviando)return;
-      aplicarDados(res.data);
-      setSbar('🟢 Sincronizado','#E4F0DA','#276B0F');
-      if(!silencioso){setSyncSt('🟢 Atualizado!','#E4F0DA','#276B0F');ntf('Dados sincronizados ✅');}
-    } else {
-      var msg=(res&&res.erro)?res.erro:'resposta inválida';
-      setSbar('🔴 Erro na planilha — dados locais','#FAE0E0','#9E2B2B');
-      setSyncSt('🔴 '+msg,'#FAE0E0','#9E2B2B');
-      if(!silencioso)ntf('Erro: '+msg);
+  jsonpGet(function(res){
+    _buscando=false;
+    if(!res||!res.ok){
+      var msg=(res&&res.erro)||'resposta inválida';
+      setSbar('🔴 Erro na planilha — dados guardados no celular','#FAE0E0','#9E2B2B');
+      setSyncSt('🔴 '+msg,'#FAE0E0','#9E2B2B');return;
     }
-  };
-  var s=document.createElement('script');s.id='_js';
-  s.src=SHEETS+'?action=getAll&callback='+cb+'&t='+Date.now();
-  s.onerror=function(){clearTimeout(timer);window[cb]=function(){};setSbar('🔴 Sem conexão — dados locais','#FAE0E0','#9E2B2B');};
-  document.head.appendChild(s);
+    if(!versaoOk(res))return;
+    if(_enviando)return; // um envio começou enquanto a leitura estava no ar
+    var falta=receberDaPlanilha(res);
+    mostrarStatus(falta);
+    if(!silencioso)setSyncSt(falta?'🟡 Enviando alterações deste celular...':'🟢 Atualizado!','#E4F0DA','#276B0F');
+    if(falta)enviar();
+  },function(motivo){
+    _buscando=false;
+    var n=D.pendente?' — alterações guardadas no celular':'';
+    setSbar('🟡 Sem conexão com a planilha'+n,'#FFF3CD','#8A4F08');
+    if(!silencioso)setSyncSt('🟡 '+motivo,'#FFF3CD','#8A4F08');
+  });
 }
 
 function enviar(){
   D.pendente=true; salvarTudo();
   if(_enviando){_reenviar=true;return;}
   _enviando=true;
-  setSbar('🔄 Enviando...','#E6EFFA','#1A5EAA');
-  var rmEnviados=D.removidos.slice();
-  var xhr=new XMLHttpRequest();
-  xhr.open('POST',SHEETS,true);
-  xhr.setRequestHeader('Content-Type','text/plain;charset=utf-8');
-  xhr.timeout=30000;
-  var feito=false;
+  setSbar('🔄 Salvando na planilha...','#E6EFFA','#1A5EAA');
   var corpo=JSON.stringify({action:'sync',expenses:D.gastos,incomes:D.entradas,users:D.usuarios,cartoes:D.cartoes,compras:D.compras,removidos:D.removidos});
-  var local={g:D.gastos.slice(),e:D.entradas.slice(),c:D.cartoes.slice(),cp:D.compras.slice(),u:D.usuarios.slice()};
+  var feito=false;
+
+  function terminar(){
+    _enviando=false;
+    if(_reenviar){_reenviar=false;enviar();}
+  }
   function falhou(txt){
-    if(feito)return;feito=true;_enviando=false;
-    setSbar(txt||'🟡 Não enviado — tento de novo em 30s','#FFF3CD','#8A4F08');
-    if(_reenviar){_reenviar=false;}
+    if(feito)return;feito=true;
+    setSbar(txt,'#FFF3CD','#8A4F08');
+    setSyncSt(txt,'#FFF3CD','#8A4F08');
+    _reenviar=false;_enviando=false;
   }
-  // Plano B (Safari/iPhone bloqueia a leitura da resposta do POST):
-  // envia "às cegas" e depois confere pela leitura JSONP se tudo chegou.
+  // Resposta da planilha (via XHR ou via leitura de conferência)
+  function receber(res){
+    if(feito)return;
+    if(!res){falhou('🟡 Resposta inválida — tento de novo em 30s');return;}
+    if(!versaoOk(res)){feito=true;_enviando=false;_reenviar=false;return;}
+    if(!res.ok){falhou('🔴 Erro na planilha: '+(res.erro||res.msg||'')+' — dados guardados no celular');return;}
+    feito=true;
+    var falta=receberDaPlanilha(res);
+    mostrarStatus(falta);
+    setSyncSt(falta?'🟡 Faltou confirmar '+falta+' item(ns) — reenviando':'🟢 Salvo e conferido na planilha','#E4F0DA','#276B0F');
+    if(falta&&!_reenviar)_reenviar=true;
+    terminar();
+  }
+  // Plano B (Safari/iPhone não deixa ler a resposta do POST):
+  // envia "às cegas" e confere lendo a planilha de volta.
   function planoB(){
-    if(feito||!window.fetch){falhou('🟡 Sem conexão — salvo no celular, envio depois');return;}
+    if(feito)return;
+    if(!window.fetch){falhou('🟡 Sem conexão — guardado no celular, envio depois');return;}
     fetch(SHEETS,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=utf-8'},body:corpo})
-      .then(function(){setTimeout(conferir,1500);})
-      .catch(function(){falhou('🟡 Sem conexão — salvo no celular, envio depois');});
+      .then(function(){
+        setTimeout(function(){
+          jsonpGet(function(res){
+            if(feito)return;
+            if(res&&res.ok&&versaoOk(res)&&diferencaLocal(res.data||{},res.removidos||[])>0){
+              falhou('🟡 Envio não confirmado pela planilha — tento de novo em 30s');return;
+            }
+            receber(res);
+          },function(){falhou('🟡 Sem conexão — guardado no celular, envio depois');});
+        },1200);
+      })
+      .catch(function(){falhou('🟡 Sem conexão — guardado no celular, envio depois');});
   }
-  function conferir(){
-    jsonpGet(function(res){
-      if(feito)return;
-      if(!res||!res.ok||!res.data){falhou('🔴 Erro na planilha: '+((res&&res.erro)||'sem resposta'));return;}
-      if(!chegouTudo(res.data,local,rmEnviados)){falhou('🟡 Envio não confirmado — tento de novo em 30s');return;}
-      sucesso(res);
-    },function(){falhou('🟡 Sem conexão — salvo no celular, envio depois');});
-  }
-  function sucesso(res){
-    feito=true;_enviando=false;
-    D.removidos=D.removidos.filter(function(id){return rmEnviados.indexOf(id)<0;});
-    if(_reenviar){_reenviar=false;salvarTudo();enviar();return;}
-    D.pendente=false;
-    if(res.data)aplicarDados(res.data);else salvarTudo();
-    setSbar('🟢 Salvo na planilha','#E4F0DA','#276B0F');
-    setSyncSt('🟢 Salvo!','#E4F0DA','#276B0F');
-  }
-  xhr.onreadystatechange=function(){
-    if(xhr.readyState!==4||feito)return;
-    if(xhr.status===0)return; // tratado por onerror/ontimeout
-    var res=null;try{res=JSON.parse(xhr.responseText);}catch(e){}
-    if(!res){falhou('🟡 Resposta inválida da planilha — tento de novo');return;}
-    if(!res.ok){falhou('🔴 Erro na planilha: '+(res.erro||res.msg||''));setSyncSt('🔴 '+(res.erro||res.msg||'erro'),'#FAE0E0','#9E2B2B');return;}
-    sucesso(res);
-  };
-  xhr.onerror=planoB;
-  xhr.ontimeout=planoB;
-  try{xhr.send(corpo);}catch(e){planoB();}
+
+  // Antes de enviar, confere a versão do script (evita script antigo
+  // sobrescrevendo a planilha com os dados de um celular só).
+  jsonpGet(function(res){
+    if(!res||!res.ok){falhou('🔴 Erro na planilha: '+((res&&res.erro)||'resposta inválida')+' — guardado no celular');return;}
+    if(!versaoOk(res)){feito=true;_enviando=false;_reenviar=false;return;}
+    var xhr=new XMLHttpRequest();
+    xhr.open('POST',SHEETS,true);
+    xhr.setRequestHeader('Content-Type','text/plain;charset=utf-8');
+    xhr.timeout=45000;
+    xhr.onreadystatechange=function(){
+      if(xhr.readyState!==4||feito||xhr.status===0)return;
+      var r=null;try{r=JSON.parse(xhr.responseText);}catch(e){}
+      if(!r){planoB();return;}
+      receber(r);
+    };
+    xhr.onerror=planoB;
+    xhr.ontimeout=planoB;
+    try{xhr.send(corpo);}catch(e){planoB();}
+  },function(){falhou('🟡 Sem conexão — guardado no celular, envio depois');});
 }
 
-// Confere se a planilha já tem tudo o que este celular enviou
-function chegouTudo(srv,local,rm){
-  function idx(arr){var m={};(arr||[]).forEach(function(x){m[String(x.id)]=x;});return m;}
-  function ok(locArr,srvArr){
-    var m=idx(srvArr);
-    return locArr.every(function(x){
-      if(x.joint)return true;
-      var y=m[String(x.id)];if(!y)return false;
-      return String(y.atualizado||y.criado||'')>=String(x.atualizado||x.criado||'');
-    });
-  }
-  var todos=[].concat(srv.expenses||[],srv.incomes||[],srv.cartoes||[],srv.compras||[],srv.users||[]);
-  var ids={};todos.forEach(function(x){ids[String(x.id)]=1;});
-  if(rm.some(function(id){return ids[String(id)];}))return false;
-  return ok(local.g,srv.expenses)&&ok(local.e,srv.incomes)&&ok(local.c,srv.cartoes)&&ok(local.cp,srv.compras)&&ok(local.u,srv.users);
+function iniciarSync(){
+  pararSync();
+  buscar(true);
+  D.timer=setInterval(function(){if(D.pendente&&!_enviando)enviar();else buscar(true);},30000);
 }
 
-function jsonpGet(onOk,onFail){
-  var cb='_cv'+Date.now()+Math.floor(Math.random()*999);
-  var sc=document.createElement('script');
-  var t=setTimeout(function(){window[cb]=function(){};limpar();onFail();},15000);
-  function limpar(){if(sc.parentNode)sc.parentNode.removeChild(sc);}
-  window[cb]=function(res){clearTimeout(t);window[cb]=function(){};limpar();onOk(res);};
-  sc.onerror=function(){clearTimeout(t);window[cb]=function(){};limpar();onFail();};
-  sc.src=SHEETS+'?action=getAll&callback='+cb+'&t='+Date.now();
-  document.head.appendChild(sc);
-}
-
-function iniciarSync(){pararSync();buscar(true);D.timer=setInterval(function(){buscar(true);},30000);}
 function pararSync(){if(D.timer){clearInterval(D.timer);D.timer=null;}}
 
 // ═══════════════════════════════════════════════
@@ -1430,11 +1488,14 @@ document.getElementById('btn-add-pess').addEventListener('click',function(){
 // ═══════════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════════
-document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible')buscar(true);});
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'){if(D.pendente&&!_enviando)enviar();else buscar(true);}});
+window.addEventListener('beforeunload',function(e){if(D.pendente){e.preventDefault();e.returnValue='';}});
 
+try{if(navigator.storage&&navigator.storage.persist)navigator.storage.persist();}catch(e){}
 carregarLocal();
 rLogin();
-buscar(true); // busca Sheets em paralelo enquanto usuário digita a senha
+buscar(true); // mescla com a planilha em paralelo (nunca apaga dados locais)
+setInterval(function(){if(!D.timer){if(D.pendente&&!_enviando)enviar();}},30000); // mesmo fora do app, reenvia pendências
 </script>
 </body>
 </html>
